@@ -4,13 +4,26 @@ import os
 import shutil
 import sys
 import time
+import threading
+import keyboard
 from duckduckgo_search import DDGS
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 # --- Configuration ---
-load_dotenv()  # Load environment variables if needed (e.g., for future API keys)
+load_dotenv()  # Load environment variables from .env file
 ASSISTANT_NAME = "Operator"
-WORKING_DIRECTORY = os.getcwd() # Default to current working directory
+WORKING_DIRECTORY = os.getcwd()  # Default to current working directory
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Get API key from .env file
+LISTENING_ACTIVE = False
+GEMINI_MODEL = "gemini-2.5-pro-exp-03-25"
+
+# --- Initialize Gemini AI API ---
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("Warning: GEMINI_API_KEY not found in environment variables.")
+    print("Please create a .env file with GEMINI_API_KEY=your_api_key")
 
 # --- Initialization ---
 try:
@@ -48,13 +61,18 @@ def speak(text):
     except Exception as e:
         print(f"Error in TTS: {e}")
 
-def listen():
+def listen(timeout=5):
     """Listens for a command and transcribes it."""
+    global LISTENING_ACTIVE
+    
+    if not LISTENING_ACTIVE:
+        return None
+        
     with microphone as source:
         print("Listening...")
-        recognizer.pause_threshold = 1.0 # seconds of non-speaking audio before phrase is considered complete
+        recognizer.pause_threshold = 1.0  # seconds of non-speaking audio before phrase is considered complete
         try:
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=15)
         except sr.WaitTimeoutError:
             print("No command detected.")
             return None
@@ -66,6 +84,13 @@ def listen():
         print("Recognizing...")
         command = recognizer.recognize_google(audio)
         print(f"You said: {command}")
+        
+        # Check for "over and out" to stop listening
+        if "over and out" in command.lower():
+            LISTENING_ACTIVE = False
+            speak("Listening mode deactivated.")
+            return "over and out"
+            
         return command.lower()
     except sr.UnknownValueError:
         print("Sorry, I could not understand the audio.")
@@ -98,61 +123,316 @@ def confirm_action(action_description):
     speak("Confirmation failed after multiple attempts. Action cancelled.")
     return False
 
+def ask_question(question):
+    """Asks a question and returns the response."""
+    speak(question)
+    attempts = 0
+    max_attempts = 3
+    while attempts < max_attempts:
+        response = listen(timeout=10)  # Longer timeout for detailed responses
+        if response and response != "over and out":
+            return response
+        elif response == "over and out":
+            return None
+        else:
+            speak("I didn't catch that. Could you please respond?")
+        attempts += 1
+    speak("Failed to get a response after multiple attempts.")
+    return None
+
+def generate_ai_content(prompt):
+    """Generate content using Gemini AI."""
+    if not GEMINI_API_KEY:
+        speak("Gemini API key not configured. Please set up your API key in the .env file.")
+        return None
+        
+    try:
+        speak("Generating content with Gemini AI...")
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        speak(f"Error generating content with Gemini AI: {e}")
+        return None
+
+def keyboard_listener():
+    """Listen for keyboard 'i' press to activate listening mode."""
+    global LISTENING_ACTIVE
+    
+    def on_i_press(event):
+        global LISTENING_ACTIVE
+        if event.name == 'i' and not LISTENING_ACTIVE:
+            LISTENING_ACTIVE = True
+            print("\nListening mode activated (press 'i').")
+            speak("Listening mode activated. Say 'over and out' to stop listening.")
+    
+    keyboard.on_press(on_i_press)
+    
+    # Keep the keyboard listener running
+    keyboard.wait()
+
 # --- Command Handlers ---
 
 def handle_file_creation(command):
-    """Handles file creation commands."""
+    """Handles file creation commands with more dynamic options."""
     try:
-        # Basic parsing: assumes "create file filename.ext"
+        # Extract path information
+        # Pattern: "on my system create file [filename] in [directory]"
         parts = command.split()
-        if len(parts) < 3 or parts[1] != "file":
-             speak("Invalid create file command. Please say 'create file' followed by the filename.")
-             return
-        filename = parts[2]
-        # Improve robustness for filenames potentially containing spaces later
-        if len(parts) > 3:
-            filename = " ".join(parts[2:]) # Basic handling for spaces in filename
-
-        filepath = os.path.join(WORKING_DIRECTORY, filename)
-
+        
+        # Find the 'file' keyword position
+        try:
+            file_index = parts.index("file")
+        except ValueError:
+            speak("I didn't catch the file name. Please specify a file to create.")
+            return
+            
+        # Check if directory is specified
+        dir_path = WORKING_DIRECTORY
+        if "in" in parts[file_index+1:]:
+            in_index = parts.index("in", file_index)
+            filename = " ".join(parts[file_index+1:in_index])
+            dirname = " ".join(parts[in_index+1:])
+            
+            # Ask for directory clarification if needed
+            if not dirname or dirname.isspace():
+                dirname = ask_question("In which directory should I create this file?")
+                if not dirname:
+                    speak("File creation cancelled.")
+                    return
+                    
+            dir_path = os.path.join(WORKING_DIRECTORY, dirname)
+            
+            # Create directory if it doesn't exist
+            if not os.path.exists(dir_path):
+                should_create = ask_question(f"Directory '{dirname}' doesn't exist. Should I create it? Say yes or no.")
+                if should_create and "yes" in should_create:
+                    try:
+                        os.makedirs(dir_path)
+                        speak(f"Created directory '{dirname}'.")
+                    except Exception as e:
+                        speak(f"Failed to create directory: {e}")
+                        return
+                else:
+                    speak("File creation cancelled.")
+                    return
+        else:
+            filename = " ".join(parts[file_index+1:])
+        
+        # Ask for filename if not provided
+        if not filename or filename.isspace():
+            filename = ask_question("What should be the name of the file?")
+            if not filename:
+                speak("File creation cancelled.")
+                return
+                
+        filepath = os.path.join(dir_path, filename)
+        
+        # Check if file already exists
         if os.path.exists(filepath):
             speak(f"File '{filename}' already exists.")
-        else:
-            with open(filepath, 'w') as f:
-                f.write("") # Create an empty file
-            speak(f"File '{filename}' created successfully in {WORKING_DIRECTORY}.")
-    except IndexError:
-         speak("Please specify a filename after 'create file'.")
-    except OSError as e:
-        speak(f"Error creating file: {e}")
+            should_overwrite = ask_question("Would you like to overwrite it? Say yes or no.")
+            if not should_overwrite or "no" in should_overwrite:
+                speak("File creation cancelled.")
+                return
+        
+        # Ask if user wants to add content
+        should_add_content = ask_question("Would you like me to generate content for this file using Gemini AI? Say yes or no.")
+        
+        content = ""
+        if should_add_content and "yes" in should_add_content:
+            content_prompt = ask_question("What would you like the content to be about?")
+            if content_prompt:
+                content = generate_ai_content(content_prompt)
+                if not content:
+                    speak("Failed to generate content. Creating empty file instead.")
+                    content = ""
+        
+        # Create the file
+        with open(filepath, 'w') as f:
+            f.write(content or "")
+            
+        speak(f"File '{filename}' created successfully in {os.path.basename(dir_path)}.")
+        
     except Exception as e:
         speak(f"An unexpected error occurred during file creation: {e}")
 
-def handle_directory_creation(command):
-    """Handles directory creation commands."""
+def handle_file_editing(command):
+    """Handles file editing commands."""
     try:
+        # Extract path information 
         parts = command.split()
-        if len(parts) < 3 or parts[1] != "directory":
-             speak("Invalid create directory command. Please say 'create directory' followed by the directory name.")
-             return
-        dirname = parts[2]
-        if len(parts) > 3:
-            dirname = " ".join(parts[2:])
+        
+        # Find the 'file' keyword position
+        try:
+            file_index = parts.index("file")
+        except ValueError:
+            speak("I didn't catch which file to edit. Please specify a file.")
+            return
+            
+        # Get filename
+        if len(parts) <= file_index + 1:
+            filename = ask_question("Which file would you like to edit?")
+            if not filename:
+                speak("File editing cancelled.")
+                return
+        else:
+            filename = " ".join(parts[file_index+1:])
+            
+        filepath = os.path.join(WORKING_DIRECTORY, filename)
+        
+        # Check if file exists
+        if not os.path.isfile(filepath):
+            # Check if it's in a subdirectory
+            found = False
+            for root, dirs, files in os.walk(WORKING_DIRECTORY):
+                if filename in files:
+                    filepath = os.path.join(root, filename)
+                    found = True
+                    break
+                    
+            if not found:
+                speak(f"File '{filename}' not found. Would you like to create it instead?")
+                create_instead = listen()
+                if create_instead and "yes" in create_instead:
+                    handle_file_creation(f"on my system create file {filename}")
+                return
+        
+        # Ask what kind of edit to perform
+        edit_type = ask_question("What would you like to do with this file? Options: append content, replace content, or view content.")
+        
+        if not edit_type:
+            speak("File editing cancelled.")
+            return
+            
+        # Handle different edit types
+        if "append" in edit_type:
+            content_prompt = ask_question("What content would you like to append? I can generate content with AI or you can dictate it.")
+            if not content_prompt:
+                speak("Editing cancelled.")
+                return
+                
+            if "generate" in content_prompt or "ai" in content_prompt:
+                prompt = ask_question("What should the generated content be about?")
+                if prompt:
+                    content = generate_ai_content(prompt)
+                    if content:
+                        with open(filepath, 'a') as f:
+                            f.write("\n" + content)
+                        speak(f"Content appended to '{filename}'.")
+                    else:
+                        speak("Failed to generate content. No changes made.")
+            else:
+                with open(filepath, 'a') as f:
+                    f.write("\n" + content_prompt)
+                speak(f"Content appended to '{filename}'.")
+                
+        elif "replace" in edit_type:
+            content_prompt = ask_question("What content would you like to add? I can generate content with AI or you can dictate it.")
+            if not content_prompt:
+                speak("Editing cancelled.")
+                return
+                
+            if "generate" in content_prompt or "ai" in content_prompt:
+                prompt = ask_question("What should the generated content be about?")
+                if prompt:
+                    content = generate_ai_content(prompt)
+                    if content:
+                        with open(filepath, 'w') as f:
+                            f.write(content)
+                        speak(f"Content replaced in '{filename}'.")
+                    else:
+                        speak("Failed to generate content. No changes made.")
+            else:
+                with open(filepath, 'w') as f:
+                    f.write(content_prompt)
+                speak(f"Content replaced in '{filename}'.")
+                
+        elif "view" in edit_type:
+            try:
+                with open(filepath, 'r') as f:
+                    content = f.read()
+                if content:
+                    speak(f"Here's the content of '{filename}':")
+                    print(f"\n--- Content of {filename} ---")
+                    print(content)
+                    print(f"--- End of {filename} ---\n")
+                    speak("Content displayed in the console.")
+                else:
+                    speak(f"The file '{filename}' is empty.")
+            except Exception as e:
+                speak(f"Error reading file: {e}")
+        else:
+            speak("I didn't understand the edit type. Please try again with 'append', 'replace', or 'view'.")
+            
+    except Exception as e:
+        speak(f"An unexpected error occurred during file editing: {e}")
 
-        dirpath = os.path.join(WORKING_DIRECTORY, dirname)
-
+def handle_directory_creation(command):
+    """Handles directory creation commands with more dynamic options."""
+    try:
+        # Extract directory name
+        parts = command.split()
+        
+        # Find the 'directory' keyword position
+        try:
+            dir_index = parts.index("directory")
+        except ValueError:
+            speak("I didn't catch the directory name. Please specify a directory to create.")
+            return
+            
+        # Check if parent directory is specified with "in"
+        parent_dir = WORKING_DIRECTORY
+        if "in" in parts[dir_index+1:]:
+            in_index = parts.index("in", dir_index)
+            dirname = " ".join(parts[dir_index+1:in_index])
+            parent_dirname = " ".join(parts[in_index+1:])
+            
+            # Ask for parent directory clarification if needed
+            if not parent_dirname or parent_dirname.isspace():
+                parent_dirname = ask_question("In which parent directory should I create this directory?")
+                if not parent_dirname:
+                    speak("Directory creation cancelled.")
+                    return
+                    
+            parent_dir = os.path.join(WORKING_DIRECTORY, parent_dirname)
+            
+            # Create parent directory if it doesn't exist
+            if not os.path.exists(parent_dir):
+                should_create = ask_question(f"Parent directory '{parent_dirname}' doesn't exist. Should I create it? Say yes or no.")
+                if should_create and "yes" in should_create:
+                    try:
+                        os.makedirs(parent_dir)
+                        speak(f"Created parent directory '{parent_dirname}'.")
+                    except Exception as e:
+                        speak(f"Failed to create parent directory: {e}")
+                        return
+                else:
+                    speak("Directory creation cancelled.")
+                    return
+        else:
+            dirname = " ".join(parts[dir_index+1:])
+        
+        # Ask for directory name if not provided
+        if not dirname or dirname.isspace():
+            dirname = ask_question("What should be the name of the directory?")
+            if not dirname:
+                speak("Directory creation cancelled.")
+                return
+                
+        dirpath = os.path.join(parent_dir, dirname)
+        
+        # Check if directory already exists
         if os.path.exists(dirpath):
             speak(f"Directory '{dirname}' already exists.")
-        else:
-            os.makedirs(dirpath)
-            speak(f"Directory '{dirname}' created successfully in {WORKING_DIRECTORY}.")
-    except IndexError:
-         speak("Please specify a directory name after 'create directory'.")
-    except OSError as e:
-        speak(f"Error creating directory: {e}")
+            return
+        
+        # Create the directory
+        os.makedirs(dirpath)
+        speak(f"Directory '{dirname}' created successfully in {os.path.basename(parent_dir)}.")
+        
     except Exception as e:
         speak(f"An unexpected error occurred during directory creation: {e}")
-
 
 def handle_file_listing(command):
     """Handles file and directory listing commands."""
@@ -205,12 +485,22 @@ def handle_file_deletion(command):
     """Handles file deletion commands with confirmation."""
     try:
         parts = command.split()
-        if len(parts) < 3 or parts[1] != "file":
-             speak("Invalid delete file command. Please say 'delete file' followed by the filename.")
-             return
-        filename = parts[2]
-        if len(parts) > 3:
-            filename = " ".join(parts[2:])
+        
+        # Find the 'file' keyword position
+        try:
+            file_index = parts.index("file")
+        except ValueError:
+            speak("I didn't catch the file name. Please specify a file to delete.")
+            return
+            
+        # Check if filename is provided
+        if len(parts) <= file_index + 1:
+            filename = ask_question("Which file would you like to delete?")
+            if not filename:
+                speak("File deletion cancelled.")
+                return
+        else:
+            filename = " ".join(parts[file_index+1:])
 
         filepath = os.path.join(WORKING_DIRECTORY, filename)
 
@@ -221,9 +511,19 @@ def handle_file_deletion(command):
         elif os.path.isdir(filepath):
              speak(f"'{filename}' is a directory, not a file. Use 'delete directory' instead.")
         else:
-            speak(f"File '{filename}' not found.")
-    except IndexError:
-         speak("Please specify a filename after 'delete file'.")
+            # Check if the file exists in any subdirectory
+            found = False
+            for root, dirs, files in os.walk(WORKING_DIRECTORY):
+                if filename in files:
+                    filepath = os.path.join(root, filename)
+                    found = True
+                    if confirm_action(f"delete the file '{filename}' located in {os.path.relpath(root, WORKING_DIRECTORY)}"):
+                        os.remove(filepath)
+                        speak(f"File '{filename}' deleted successfully.")
+                    break
+                    
+            if not found:
+                speak(f"File '{filename}' not found.")
     except OSError as e:
         speak(f"Error deleting file: {e}")
     except Exception as e:
@@ -233,12 +533,22 @@ def handle_directory_deletion(command):
     """Handles directory deletion commands with confirmation."""
     try:
         parts = command.split()
-        if len(parts) < 3 or parts[1] != "directory":
-             speak("Invalid delete directory command. Please say 'delete directory' followed by the directory name.")
-             return
-        dirname = parts[2]
-        if len(parts) > 3:
-            dirname = " ".join(parts[2:])
+        
+        # Find the 'directory' keyword position
+        try:
+            dir_index = parts.index("directory")
+        except ValueError:
+            speak("I didn't catch the directory name. Please specify a directory to delete.")
+            return
+            
+        # Check if directory name is provided
+        if len(parts) <= dir_index + 1:
+            dirname = ask_question("Which directory would you like to delete?")
+            if not dirname:
+                speak("Directory deletion cancelled.")
+                return
+        else:
+            dirname = " ".join(parts[dir_index+1:])
 
         dirpath = os.path.join(WORKING_DIRECTORY, dirname)
 
@@ -250,8 +560,6 @@ def handle_directory_deletion(command):
              speak(f"'{dirname}' is a file, not a directory. Use 'delete file' instead.")
         else:
             speak(f"Directory '{dirname}' not found.")
-    except IndexError:
-         speak("Please specify a directory name after 'delete directory'.")
     except OSError as e:
         speak(f"Error deleting directory: {e}")
     except Exception as e:
@@ -305,52 +613,129 @@ def handle_web_query(command):
     except Exception as e:
         speak(f"An error occurred during the web search: {e}")
 
+def handle_ai_query(command):
+    """Handles AI queries using Gemini."""
+    try:
+        # Extract query: "ask ai X", "tell me X", etc.
+        query = command
+        
+        if not query:
+            speak("What would you like to ask Gemini AI?")
+            query_response = listen()
+            if query_response:
+                query = query_response
+            else:
+                speak("Query cancelled.")
+                return
+
+        speak(f"Asking Gemini AI about '{query}'...")
+        response = generate_ai_content(query)
+        
+        if response:
+            speak("Here's what Gemini AI says:")
+            # Split long responses into chunks to avoid TTS issues
+            max_chunk_size = 500
+            for i in range(0, len(response), max_chunk_size):
+                chunk = response[i:i+max_chunk_size]
+                print(chunk)
+                speak(chunk)
+        else:
+            speak("Sorry, I couldn't get a response from Gemini AI.")
+
+    except Exception as e:
+        speak(f"An error occurred while querying Gemini AI: {e}")
 
 # --- Main Loop ---
 
 def run_assistant():
     """Main loop to listen for commands and execute them."""
-    speak("Operator Assistant activated. How can I help you?")
-
+    global LISTENING_ACTIVE
+    
+    speak("Operator Assistant activated. Press 'i' to start listening. Say 'over and out' to stop listening.")
+    
+    # Start keyboard listener in a separate thread
+    keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    keyboard_thread.start()
+    
     while True:
-        command = listen()
-
-        if command:
-            # --- Intent Recognition ---
-            if "create file" in command:
-                handle_file_creation(command)
-            elif "create directory" in command or "make directory" in command:
-                handle_directory_creation(command)
-            elif "list files" in command or "list directory" in command or "show files" in command:
-                handle_file_listing(command)
-            elif "delete file" in command or "remove file" in command:
-                handle_file_deletion(command)
-            elif "delete directory" in command or "remove directory" in command:
-                handle_directory_deletion(command)
-            elif "search for" in command or "what is" in command or "look up" in command or "search " in command:
-                 # Check search triggers last as they are broad
-                 handle_web_query(command)
-            elif "stop" in command or "exit" in command or "quit" in command or "goodbye" in command:
-                speak("Deactivating Operator Assistant. Goodbye!")
-                break
-            # Add more intents/commands here
-            # elif "open application" in command:
-            #    handle_app_open(command) # Example for future extension
-            # elif "tell me a joke" in command:
-            #    handle_joke(command) # Example for future extension
+        try:
+            if LISTENING_ACTIVE:
+                command = listen()
+                
+                if command == "over and out":
+                    continue  # Already handled in listen()
+                elif command:
+                    # --- Intent Recognition ---
+                    if "on my system" in command:
+                        # Handle system commands
+                        if "create file" in command or "make file" in command:
+                            handle_file_creation(command)
+                        elif "edit file" in command or "modify file" in command:
+                            handle_file_editing(command)
+                        elif "create directory" in command or "make directory" in command:
+                            handle_directory_creation(command)
+                        elif "list files" in command or "list directory" in command or "show files" in command:
+                            handle_file_listing(command)
+                        elif "delete file" in command or "remove file" in command:
+                            handle_file_deletion(command)
+                        elif "delete directory" in command or "remove directory" in command:
+                            handle_directory_deletion(command)
+                        else:
+                            speak("Sorry, I didn't understand that system command. Please try again.")
+                    elif "search for" in command or "what is" in command or "look up" in command or "search " in command:
+                        handle_web_query(command)
+                    elif "ask ai" in command or "ask gemini" in command or "tell me about" in command:
+                        handle_ai_query(command)
+                    elif "stop" in command or "exit" in command or "quit" in command or "goodbye" in command:
+                        speak("Deactivating Operator Assistant. Goodbye!")
+                        break
+                    else:
+                        # Forward to Gemini AI for general queries
+                        handle_ai_query(command)
             else:
-                # Basic fallback or clarification
-                speak("Sorry, I didn't understand that command clearly. Can you please repeat or rephrase?")
-        else:
-            # Optional: Add a prompt if nothing was heard for a while
-            # speak("Is there anything else?")
-            pass # Continue listening silently if listen() returned None
-
-        time.sleep(0.5) # Small delay to prevent tight looping issues
-
+                # Wait a bit to avoid tight loop when not listening
+                time.sleep(0.5)
+                
+        except KeyboardInterrupt:
+            speak("Assistant interrupted by user. Press 'i' to start listening again or Ctrl+C again to exit.")
+            try:
+                time.sleep(2)  # Give time to decide
+            except KeyboardInterrupt:
+                speak("Shutting down Operator Assistant. Goodbye!")
+                break
 
 if __name__ == "__main__":
     try:
+        # Check for required modules
+        required_modules = {
+            "speech_recognition": sr,
+            "pyttsx3": pyttsx3,
+            "keyboard": keyboard,
+            "duckduckgo_search": DDGS,
+            "google.generativeai": genai,
+            "dotenv": load_dotenv
+        }
+        
+        missing_modules = []
+        for name, module in required_modules.items():
+            if module is None:
+                missing_modules.append(name)
+                
+        if missing_modules:
+            print("The following required modules are missing:")
+            for module in missing_modules:
+                print(f"- {module}")
+            print("\nPlease install them using pip:")
+            print(f"pip install {' '.join(missing_modules)}")
+            sys.exit(1)
+            
+        # Check for API key
+        if not GEMINI_API_KEY:
+            print("Warning: GEMINI_API_KEY not found!")
+            print("Some features will not work without the Gemini API key.")
+            print("Please create a .env file in the same directory with:")
+            print("GEMINI_API_KEY=your_api_key_here")
+            
         run_assistant()
     except KeyboardInterrupt:
         print("\nOperator Assistant interrupted by user. Exiting.")
@@ -364,5 +749,9 @@ if __name__ == "__main__":
             pass # Ignore TTS errors during shutdown
     finally:
         # Clean up resources if necessary
-        if 'tts_engine' in locals() and tts_engine._inLoop:
-             tts_engine.endLoop()
+        if 'tts_engine' in locals():
+            try:
+                if hasattr(tts_engine, '_inLoop') and tts_engine._inLoop:
+                    tts_engine.endLoop()
+            except:
+                pass
