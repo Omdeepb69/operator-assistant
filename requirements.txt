@@ -1,0 +1,8 @@
+SpeechRecognition (or consider Vosk for offline capability)
+pyttsx3 (or gTTS/elevenlabs for higher quality voices)
+os
+shutil
+requests
+beautifulsoup4 (or specific search engine APIs like duckduckgo_search)
+python-dotenv (for managing any potential API keys)
+sounddevice (or pyaudio for audio I/O)
